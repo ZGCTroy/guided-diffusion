@@ -10,6 +10,7 @@ from torch.utils.data import DataLoader, Dataset
 
 def load_data(
     *,
+
     data_dir,
     batch_size,
     image_size,
@@ -17,6 +18,9 @@ def load_data(
     deterministic=False,
     random_crop=False,
     random_flip=True,
+    dataset_type="imagenet",
+    used_attributes="",
+    tot_class=1000
 ):
     """
     For a dataset, create a generator over (images, kwargs) pairs.
@@ -26,6 +30,9 @@ def load_data(
     The kwargs dict can be used for class labels, in which case the key is "y"
     and the values are integer tensors of class labels.
 
+    :param tot_class:
+    :param used_attributes:
+    :param dataset_type:
     :param data_dir: a dataset directory.
     :param batch_size: the batch size of each returned pair.
     :param image_size: the size to which images are resized.
@@ -38,14 +45,47 @@ def load_data(
     """
     if not data_dir:
         raise ValueError("unspecified data directory")
+
     all_files = _list_image_files_recursively(data_dir)
     classes = None
+
+    CelebA_Attr_file = "list_attr_celeba.txt"
+    with open(CelebA_Attr_file, "r") as Attr_file:
+        Attr_info = Attr_file.readlines()
+        Attr_info = Attr_info[1:]
+
+    def get_attribute(path):
+        """
+        Given a image path, grab its corresponding attribute label 
+        """
+        import os
+        idx = int(os.path.basename(path)[:-4])
+        attributes = Attr_info[idx].split()
+        atts = []
+        for num in used_attributes.split(','):
+            idx = int(num)
+            att = (float(attributes[idx]) + 1.) / 2.
+            atts.append(att)
+        return atts
+
     if class_cond:
         # Assume classes are the first part of the filename,
-        # before an underscore.
-        class_names = [bf.basename(path).split("_")[0] for path in all_files]
-        sorted_classes = {x: i for i, x in enumerate(sorted(set(class_names)))}
-        classes = [sorted_classes[x] for x in class_names]
+        # before an underscore. 
+        if dataset_type == 'imagenet':
+            # path.split('/')[-2]
+            class_names = [path.split("/")[-2] for path in all_files]
+            sorted_classes = {x: i for i, x in enumerate(sorted(set(class_names)))}
+
+            class_names = [x for x in class_names if sorted_classes[x] < tot_class]
+            classes = [sorted_classes[x] for x in class_names]
+
+            all_files = [ x for x in all_files if sorted_classes[x.split("/")[-2]] < tot_class ]
+            assert len(all_files) == len(classes)
+            print(len(classes), len(class_names), len(all_files))
+
+        elif dataset_type == 'celebahq':
+            classes = [get_attribute(path) for path in all_files]
+
     dataset = ImageDataset(
         image_size,
         all_files,
@@ -54,6 +94,7 @@ def load_data(
         num_shards=MPI.COMM_WORLD.Get_size(),
         random_crop=random_crop,
         random_flip=random_flip,
+        dataset_type=dataset_type
     )
     if deterministic:
         loader = DataLoader(
@@ -89,6 +130,8 @@ class ImageDataset(Dataset):
         num_shards=1,
         random_crop=False,
         random_flip=True,
+        dataset_type='imagenet',
+
     ):
         super().__init__()
         self.resolution = resolution
@@ -96,6 +139,8 @@ class ImageDataset(Dataset):
         self.local_classes = None if classes is None else classes[shard:][::num_shards]
         self.random_crop = random_crop
         self.random_flip = random_flip
+        self.dataset_type = dataset_type
+
 
     def __len__(self):
         return len(self.local_images)
@@ -119,7 +164,13 @@ class ImageDataset(Dataset):
 
         out_dict = {}
         if self.local_classes is not None:
-            out_dict["y"] = np.array(self.local_classes[idx], dtype=np.int64)
+            # out_dict["y"] = np.array(self.local_classes[idx], dtype=np.int64)
+            if self.dataset_type == 'imagenet':
+                out_dict["y"] = np.array(self.local_classes[idx], dtype=np.int64)
+
+            elif self.dataset_type == 'celebahq':
+                out_dict["y"] = np.array(self.local_classes[idx], dtype=np.float32)
+
         return np.transpose(arr, [2, 0, 1]), out_dict
 
 

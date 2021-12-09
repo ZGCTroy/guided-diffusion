@@ -10,12 +10,13 @@ from functools import partial
 from multiprocessing import cpu_count
 from multiprocessing.pool import ThreadPool
 from typing import Iterable, Optional, Tuple
-
 import numpy as np
 import requests
-import tensorflow.compat.v1 as tf
+# import tensorflow.compat.v1 as tf
+import tensorflow as tf
 from scipy import linalg
 from tqdm.auto import tqdm
+import pandas as pd
 
 INCEPTION_V3_URL = "https://openaipublic.blob.core.windows.net/diffusion/jul-2021/ref_batches/classify_image_graph_def.pb"
 INCEPTION_V3_PATH = "classify_image_graph_def.pb"
@@ -24,10 +25,55 @@ FID_POOL_NAME = "pool_3:0"
 FID_SPATIAL_NAME = "mixed_6/conv:0"
 
 
+def quick_evaluate(ref_batch='', sample_batch=''):
+    config = tf.ConfigProto(
+        allow_soft_placement=True  # allows DecodeJpeg to run on CPU in Inception graph
+    )
+    config.gpu_options.allow_growth = True
+    evaluator = Evaluator(tf.Session(config=config))
+
+    print("warming up TensorFlow...")
+    # This will cause TF to print a bunch of verbose stuff now rather
+    # than after the next print(), to help prevent confusion.
+    evaluator.warmup()
+
+    print("computing reference batch activations...")
+    ref_acts = evaluator.read_activations(ref_batch)
+    print("computing/reading reference batch statistics...")
+    ref_stats, ref_stats_spatial = evaluator.read_statistics(ref_batch, ref_acts)
+
+    print("computing sample batch activations...")
+    sample_acts = evaluator.read_activations(sample_batch)
+    print("computing/reading sample batch statistics...")
+    sample_stats, sample_stats_spatial = evaluator.read_statistics(sample_batch, sample_acts)
+
+    print("Computing evaluations...")
+    inception_score = evaluator.compute_inception_score(sample_acts[0])
+    print("Inception Score:", inception_score)
+    fid = sample_stats.frechet_distance(ref_stats)
+    print("FID:", fid)
+    sfid = sample_stats_spatial.frechet_distance(ref_stats_spatial)
+    print("sFID:", sfid)
+    prec, recall = evaluator.compute_prec_recall(ref_acts[0], sample_acts[0])
+    print("Precision:", prec)
+    print("Recall:", recall)
+
+    return {
+        'ref_batch': ref_batch,
+        'sample_batch': sample_batch,
+        'inception_score': inception_score,
+        'fid': fid,
+        'sfid': sfid,
+        'precision': prec,
+        'recall': recall
+    }
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("ref_batch", help="path to reference batch npz file")
-    parser.add_argument("sample_batch", help="path to sample batch npz file")
+    parser.add_argument("--ref_batch", type=str, default="", help="path to reference batch npz file")
+    parser.add_argument("--sample_batch", type=str, default="", help="path to sample batch npz file")
+    parser.add_argument("--save_result_path", type=str, default="", help="path to save result dict")
     args = parser.parse_args()
 
     config = tf.ConfigProto(
@@ -52,12 +98,29 @@ def main():
     sample_stats, sample_stats_spatial = evaluator.read_statistics(args.sample_batch, sample_acts)
 
     print("Computing evaluations...")
-    print("Inception Score:", evaluator.compute_inception_score(sample_acts[0]))
-    print("FID:", sample_stats.frechet_distance(ref_stats))
-    print("sFID:", sample_stats_spatial.frechet_distance(ref_stats_spatial))
+    inception_score = evaluator.compute_inception_score(sample_acts[0])
+    print("Inception Score:", inception_score)
+    fid = sample_stats.frechet_distance(ref_stats)
+    print("FID:", fid)
+    sfid = sample_stats_spatial.frechet_distance(ref_stats_spatial)
+    print("sFID:", sfid)
     prec, recall = evaluator.compute_prec_recall(ref_acts[0], sample_acts[0])
     print("Precision:", prec)
     print("Recall:", recall)
+
+    import yaml
+    with open(args.save_result_path, 'w') as f:
+        result_dict = {
+            'name': args.save_result_path,
+            'ref_batch': args.ref_batch,
+            'sample_batch': args.sample_batch,
+            'inception_score': inception_score,
+            'fid': fid,
+            'sfid': sfid,
+            'precision': prec,
+            'recall': recall
+        }
+        f.write(yaml.dump(result_dict))
 
 
 class InvalidFIDException(Exception):
@@ -84,10 +147,10 @@ class FIDStatistics:
         sigma2 = np.atleast_2d(sigma2)
 
         assert (
-            mu1.shape == mu2.shape
+                mu1.shape == mu2.shape
         ), f"Training and test mean vectors have different lengths: {mu1.shape}, {mu2.shape}"
         assert (
-            sigma1.shape == sigma2.shape
+                sigma1.shape == sigma2.shape
         ), f"Training and test covariances have different dimensions: {sigma1.shape}, {sigma2.shape}"
 
         diff = mu1 - mu2
@@ -96,8 +159,8 @@ class FIDStatistics:
         covmean, _ = linalg.sqrtm(sigma1.dot(sigma2), disp=False)
         if not np.isfinite(covmean).all():
             msg = (
-                "fid calculation produces singular product; adding %s to diagonal of cov estimates"
-                % eps
+                    "fid calculation produces singular product; adding %s to diagonal of cov estimates"
+                    % eps
             )
             warnings.warn(msg)
             offset = np.eye(sigma1.shape[0]) * eps
@@ -117,10 +180,10 @@ class FIDStatistics:
 
 class Evaluator:
     def __init__(
-        self,
-        session,
-        batch_size=64,
-        softmax_batch_size=512,
+            self,
+            session,
+            batch_size=64,
+            softmax_batch_size=512,
     ):
         self.sess = session
         self.batch_size = batch_size
@@ -162,7 +225,7 @@ class Evaluator:
         )
 
     def read_statistics(
-        self, npz_path: str, activations: Tuple[np.ndarray, np.ndarray]
+            self, npz_path: str, activations: Tuple[np.ndarray, np.ndarray]
     ) -> Tuple[FIDStatistics, FIDStatistics]:
         obj = np.load(npz_path)
         if "mu" in list(obj.keys()):
@@ -179,20 +242,20 @@ class Evaluator:
     def compute_inception_score(self, activations: np.ndarray, split_size: int = 5000) -> float:
         softmax_out = []
         for i in range(0, len(activations), self.softmax_batch_size):
-            acts = activations[i : i + self.softmax_batch_size]
+            acts = activations[i: i + self.softmax_batch_size]
             softmax_out.append(self.sess.run(self.softmax, feed_dict={self.softmax_input: acts}))
         preds = np.concatenate(softmax_out, axis=0)
         # https://github.com/openai/improved-gan/blob/4f5d1ec5c16a7eceb206f42bfc652693601e1d5c/inception_score/model.py#L46
         scores = []
         for i in range(0, len(preds), split_size):
-            part = preds[i : i + split_size]
+            part = preds[i: i + split_size]
             kl = part * (np.log(part) - np.log(np.expand_dims(np.mean(part, 0), 0)))
             kl = np.mean(np.sum(kl, 1))
             scores.append(np.exp(kl))
         return float(np.mean(scores))
 
     def compute_prec_recall(
-        self, activations_ref: np.ndarray, activations_sample: np.ndarray
+            self, activations_ref: np.ndarray, activations_sample: np.ndarray
     ) -> Tuple[float, float]:
         radii_1 = self.manifold_estimator.manifold_radii(activations_ref)
         radii_2 = self.manifold_estimator.manifold_radii(activations_sample)
@@ -210,13 +273,13 @@ class ManifoldEstimator:
     """
 
     def __init__(
-        self,
-        session,
-        row_batch_size=10000,
-        col_batch_size=10000,
-        nhood_sizes=(3,),
-        clamp_to_percentile=None,
-        eps=1e-5,
+            self,
+            session,
+            row_batch_size=10000,
+            col_batch_size=10000,
+            nhood_sizes=(3,),
+            clamp_to_percentile=None,
+            eps=1e-5,
     ):
         """
         Estimate the manifold of given feature vectors.
@@ -253,7 +316,7 @@ class ManifoldEstimator:
         distance_batch = np.zeros([self.row_batch_size, num_images], dtype=np.float32)
         seq = np.arange(max(self.nhood_sizes) + 1, dtype=np.int32)
 
-        for begin1 in range(0, num_images, self.row_batch_size):
+        for begin1 in tqdm(range(0, num_images, self.row_batch_size)):
             end1 = min(begin1 + self.row_batch_size, num_images)
             row_batch = features[begin1:end1]
 
@@ -263,14 +326,14 @@ class ManifoldEstimator:
 
                 # Compute distances between batches.
                 distance_batch[
-                    0 : end1 - begin1, begin2:end2
+                0: end1 - begin1, begin2:end2
                 ] = self.distance_block.pairwise_distances(row_batch, col_batch)
 
             # Find the k-nearest neighbor from the current batch.
             radii[begin1:end1, :] = np.concatenate(
                 [
                     x[:, self.nhood_sizes]
-                    for x in _numpy_partition(distance_batch[0 : end1 - begin1, :], seq, axis=1)
+                    for x in _numpy_partition(distance_batch[0: end1 - begin1, :], seq, axis=1)
                 ],
                 axis=0,
             )
@@ -300,20 +363,20 @@ class ManifoldEstimator:
                 ref_batch = features[begin2:end2]
 
                 distance_batch[
-                    0 : end1 - begin1, begin2:end2
+                0: end1 - begin1, begin2:end2
                 ] = self.distance_block.pairwise_distances(feature_batch, ref_batch)
 
             # From the minibatch of new feature vectors, determine if they are in the estimated manifold.
             # If a feature vector is inside a hypersphere of some reference sample, then
             # the new sample lies at the estimated manifold.
             # The radii of the hyperspheres are determined from distances of neighborhood size k.
-            samples_in_manifold = distance_batch[0 : end1 - begin1, :, None] <= radii
+            samples_in_manifold = distance_batch[0: end1 - begin1, :, None] <= radii
             batch_predictions[begin1:end1] = np.any(samples_in_manifold, axis=1).astype(np.int32)
 
             max_realism_score[begin1:end1] = np.max(
-                radii[:, 0] / (distance_batch[0 : end1 - begin1, :] + self.eps), axis=1
+                radii[:, 0] / (distance_batch[0: end1 - begin1, :] + self.eps), axis=1
             )
-            nearest_indices[begin1:end1] = np.argmin(distance_batch[0 : end1 - begin1, :], axis=1)
+            nearest_indices[begin1:end1] = np.argmin(distance_batch[0: end1 - begin1, :], axis=1)
 
         return {
             "fraction": float(np.mean(batch_predictions)),
@@ -323,11 +386,11 @@ class ManifoldEstimator:
         }
 
     def evaluate_pr(
-        self,
-        features_1: np.ndarray,
-        radii_1: np.ndarray,
-        features_2: np.ndarray,
-        radii_2: np.ndarray,
+            self,
+            features_1: np.ndarray,
+            radii_1: np.ndarray,
+            features_2: np.ndarray,
+            radii_2: np.ndarray,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Evaluate precision and recall efficiently.
@@ -342,7 +405,7 @@ class ManifoldEstimator:
         """
         features_1_status = np.zeros([len(features_1), radii_2.shape[1]], dtype=np.bool)
         features_2_status = np.zeros([len(features_2), radii_1.shape[1]], dtype=np.bool)
-        for begin_1 in range(0, len(features_1), self.row_batch_size):
+        for begin_1 in tqdm(range(0, len(features_1), self.row_batch_size)):
             end_1 = begin_1 + self.row_batch_size
             batch_1 = features_1[begin_1:end_1]
             for begin_2 in range(0, len(features_2), self.col_batch_size):
@@ -505,7 +568,7 @@ class MemoryNpzArrayReader(NpzArrayReader):
         if self.idx >= self.arr.shape[0]:
             return None
 
-        res = self.arr[self.idx : self.idx + batch_size]
+        res = self.arr[self.idx: self.idx + batch_size]
         self.idx += batch_size
         return res
 
@@ -585,7 +648,7 @@ def _download_inception_model():
 
 def _create_feature_graph(input_batch):
     _download_inception_model()
-    prefix = f"{random.randrange(2**32)}_{random.randrange(2**32)}"
+    prefix = f"{random.randrange(2 ** 32)}_{random.randrange(2 ** 32)}"
     with open(INCEPTION_V3_PATH, "rb") as f:
         graph_def = tf.GraphDef()
         graph_def.ParseFromString(f.read())
@@ -602,7 +665,7 @@ def _create_feature_graph(input_batch):
 
 def _create_softmax_graph(input_batch):
     _download_inception_model()
-    prefix = f"{random.randrange(2**32)}_{random.randrange(2**32)}"
+    prefix = f"{random.randrange(2 ** 32)}_{random.randrange(2 ** 32)}"
     with open(INCEPTION_V3_PATH, "rb") as f:
         graph_def = tf.GraphDef()
         graph_def.ParseFromString(f.read())
@@ -642,7 +705,7 @@ def _numpy_partition(arr, kth, **kwargs):
     batches = []
     for i in range(num_workers):
         size = chunk_size + (1 if i < extra else 0)
-        batches.append(arr[start_idx : start_idx + size])
+        batches.append(arr[start_idx: start_idx + size])
         start_idx += size
 
     with ThreadPool(num_workers) as pool:

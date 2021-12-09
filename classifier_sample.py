@@ -14,25 +14,34 @@ import torch.nn.functional as F
 from guided_diffusion import dist_util, logger
 from guided_diffusion.script_util import (
     NUM_CLASSES,
-    model_and_diffusion_defaults,
+    model_defaults,
+    diffusion_defaults,
     classifier_defaults,
-    create_model_and_diffusion,
+    create_model,
+    create_gaussian_diffusion,
     create_classifier,
     add_dict_to_argparser,
     args_to_dict,
 )
-
+from tqdm import tqdm
 
 def main():
     args = create_argparser().parse_args()
 
-    dist_util.setup_dist()
-    logger.configure()
+    visible_gpus_list = [str(gpu_id) for gpu_id in args.gpus.split(",")]
+    dist_util.setup_dist(visible_gpu_list=visible_gpus_list)
+
+    logger.configure(dir=os.path.join(args.log_root, args.save_name))
+    logger.log(args)
 
     logger.log("creating model and diffusion...")
-    model, diffusion = create_model_and_diffusion(
-        **args_to_dict(args, model_and_diffusion_defaults().keys())
+    model = create_model(
+        **args_to_dict(args, model_defaults().keys())
     )
+    diffusion = create_gaussian_diffusion(
+        **args_to_dict(args, diffusion_defaults().keys())
+    )
+
     model.load_state_dict(
         dist_util.load_state_dict(args.model_path, map_location="cpu")
     )
@@ -42,7 +51,9 @@ def main():
     model.eval()
 
     logger.log("loading classifier...")
-    classifier = create_classifier(**args_to_dict(args, classifier_defaults().keys()))
+    classifier = create_classifier(
+        **args_to_dict(args, classifier_defaults().keys())
+    )
     classifier.load_state_dict(
         dist_util.load_state_dict(args.classifier_path, map_location="cpu")
     )
@@ -94,7 +105,7 @@ def main():
         gathered_labels = [th.zeros_like(classes) for _ in range(dist.get_world_size())]
         dist.all_gather(gathered_labels, classes)
         all_labels.extend([labels.cpu().numpy() for labels in gathered_labels])
-        logger.log(f"created {len(all_images) * args.batch_size} samples")
+        logger.log(f"created {len(all_images) * args.batch_size} / {args.num_samples} samples")
 
     arr = np.concatenate(all_images, axis=0)
     arr = arr[: args.num_samples]
@@ -119,8 +130,12 @@ def create_argparser():
         model_path="",
         classifier_path="",
         classifier_scale=1.0,
+        log_root="",
+        save_name="",
+        gpus='3',
     )
-    defaults.update(model_and_diffusion_defaults())
+    defaults.update(diffusion_defaults())
+    defaults.update(model_defaults())
     defaults.update(classifier_defaults())
     parser = argparse.ArgumentParser()
     add_dict_to_argparser(parser, defaults)
