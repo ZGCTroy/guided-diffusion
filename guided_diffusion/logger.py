@@ -14,6 +14,7 @@ import tempfile
 import warnings
 from collections import defaultdict
 from contextlib import contextmanager
+import torch.distributed as dist
 
 DEBUG = 10
 INFO = 20
@@ -159,14 +160,19 @@ class TensorBoardOutputFormat(KVWriter):
         prefix = "events"
         path = osp.join(osp.abspath(dir), prefix)
         import tensorflow as tf
-        from tensorflow.python import pywrap_tensorflow
         from tensorflow.core.util import event_pb2
         from tensorflow.python.util import compat
 
-        self.tf = tf
+        if tf.__version__[0] == '2':
+            from tensorflow.python.client import _pywrap_events_writer
+            self.writer = _pywrap_events_writer.EventsWriter(compat.as_bytes(path))
+            self.tf = tf.compat.v1
+        elif tf.__version__[0] == '1':
+            from tensorflow.python import pywrap_tensorflow
+            self.writer = pywrap_tensorflow.EventsWriter(compat.as_bytes(path))
+            self.tf = tf
+
         self.event_pb2 = event_pb2
-        self.pywrap_tensorflow = pywrap_tensorflow
-        self.writer = pywrap_tensorflow.EventsWriter(compat.as_bytes(path))
 
     def writekvs(self, kvs):
         def summary_val(k, v):
@@ -454,7 +460,8 @@ def configure(dir=None, format_strs=None, comm=None, log_suffix=""):
     dir = os.path.expanduser(dir)
     os.makedirs(os.path.expanduser(dir), exist_ok=True)
 
-    rank = get_rank_without_mpi_import()
+    # rank = get_rank_without_mpi_import()
+    rank = dist.get_rank()
     if rank > 0:
         log_suffix = log_suffix + "-rank%03i" % rank
 

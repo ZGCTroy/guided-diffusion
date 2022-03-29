@@ -5,7 +5,7 @@ import torch as th
 import torch.distributed as dist
 
 
-def create_named_schedule_sampler(name, diffusion):
+def create_named_schedule_sampler(name, diffusion, t_range_start=0, t_range_end=1000):
     """
     Create a ScheduleSampler from a library of pre-defined samplers.
 
@@ -14,8 +14,14 @@ def create_named_schedule_sampler(name, diffusion):
     """
     if name == "uniform":
         return UniformSampler(diffusion)
+    elif name == 'range_uniform':
+        return RangeUniformSampler(diffusion, t_range_start, t_range_end)
     elif name == "loss-second-moment":
         return LossSecondMomentResampler(diffusion)
+
+    elif name == "noisy-aware-weight":
+        return NoisyImportanceSampler(diffusion)
+
     else:
         raise NotImplementedError(f"unknown schedule sampler: {name}")
 
@@ -66,6 +72,36 @@ class UniformSampler(ScheduleSampler):
     def weights(self):
         return self._weights
 
+class RangeUniformSampler(ScheduleSampler):
+    def __init__(self, diffusion, t_range_start=0, t_range_end=1000):
+        self.diffusion = diffusion
+
+        self._weights = np.zeros([diffusion.num_timesteps])
+        self._weights[t_range_start:t_range_end] = 1.0
+
+    def weights(self):
+        return self._weights
+
+class NoisyImportanceSampler(ScheduleSampler):
+    """
+    Update the reweighting using losses from a model.
+
+    call for diffusion predefined noise scheme,
+    apply the postior variance into the distribution weight sampler
+
+    :param local_ts: an integer Tensor of timesteps.
+    :param local_losses: a 1D Tensor of losses.
+    """
+    def __init__(self, diffusion, t_range_start=0, t_range_end=1000):
+        self.diffusion = diffusion
+
+        self._weights = np.zeros([diffusion.num_timesteps])
+        # self._weights[t_range_start:t_range_end] = 1.0
+        self._weights = diffusion.posterior_variance
+        self._weights = self._weights[::-1]
+
+    def weights(self):
+        return self._weights
 
 class LossAwareSampler(ScheduleSampler):
     def update_with_local_losses(self, local_ts, local_losses):

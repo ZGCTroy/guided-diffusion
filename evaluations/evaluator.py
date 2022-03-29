@@ -12,8 +12,10 @@ from multiprocessing.pool import ThreadPool
 from typing import Iterable, Optional, Tuple
 import numpy as np
 import requests
-# import tensorflow.compat.v1 as tf
 import tensorflow as tf
+
+if tf.__version__[0] == '2':
+    import tensorflow.compat.v1 as tf
 from scipy import linalg
 from tqdm.auto import tqdm
 import pandas as pd
@@ -25,19 +27,25 @@ FID_POOL_NAME = "pool_3:0"
 FID_SPATIAL_NAME = "mixed_6/conv:0"
 
 
-def quick_evaluate(ref_batch='', sample_batch=''):
+def quick_evaluate(ref_batch='', sample_batch='', batch_size=4):
+
     config = tf.ConfigProto(
-        allow_soft_placement=True  # allows DecodeJpeg to run on CPU in Inception graph
+        allow_soft_placement=False  # allows DecodeJpeg to run on CPU in Inception graph
     )
     config.gpu_options.allow_growth = True
-    evaluator = Evaluator(tf.Session(config=config))
+    # config.gpu_options.per_process_gpu_memory_fraction = 0.4
+    sess = tf.Session(config=config)
+    evaluator = Evaluator(
+        sess,
+        batch_size=batch_size,
+        softmax_batch_size=batch_size * 2
+    )
 
     print("warming up TensorFlow...")
     # This will cause TF to print a bunch of verbose stuff now rather
     # than after the next print(), to help prevent confusion.
     evaluator.warmup()
 
-    print("computing reference batch activations...")
     ref_acts = evaluator.read_activations(ref_batch)
     print("computing/reading reference batch statistics...")
     ref_stats, ref_stats_spatial = evaluator.read_statistics(ref_batch, ref_acts)
@@ -58,9 +66,10 @@ def quick_evaluate(ref_batch='', sample_batch=''):
     print("Precision:", prec)
     print("Recall:", recall)
 
+    sess.close()
     return {
-        'ref_batch': ref_batch,
-        'sample_batch': sample_batch,
+        # 'ref_batch': ref_batch,
+        # 'sample_batch': sample_batch,
         'inception_score': inception_score,
         'fid': fid,
         'sfid': sfid,
@@ -74,13 +83,18 @@ def main():
     parser.add_argument("--ref_batch", type=str, default="", help="path to reference batch npz file")
     parser.add_argument("--sample_batch", type=str, default="", help="path to sample batch npz file")
     parser.add_argument("--save_result_path", type=str, default="", help="path to save result dict")
+    parser.add_argument("--batch_size", type=int, default=4, help="path to save result dict")
     args = parser.parse_args()
 
     config = tf.ConfigProto(
         allow_soft_placement=True  # allows DecodeJpeg to run on CPU in Inception graph
     )
     config.gpu_options.allow_growth = True
-    evaluator = Evaluator(tf.Session(config=config))
+    evaluator = Evaluator(
+        tf.Session(config=config),
+        batch_size=args.batch_size,
+        softmax_batch_size=args.batch_size * 2
+    )
 
     print("warming up TensorFlow...")
     # This will cause TF to print a bunch of verbose stuff now rather
@@ -114,11 +128,11 @@ def main():
             'name': args.save_result_path,
             'ref_batch': args.ref_batch,
             'sample_batch': args.sample_batch,
-            'inception_score': inception_score,
-            'fid': fid,
-            'sfid': sfid,
-            'precision': prec,
-            'recall': recall
+            'inception_score': float(inception_score),
+            'fid': float(fid),
+            'sfid': float(sfid),
+            'precision': float(prec),
+            'recall': float(recall)
         }
         f.write(yaml.dump(result_dict))
 
@@ -182,8 +196,8 @@ class Evaluator:
     def __init__(
             self,
             session,
-            batch_size=64,
-            softmax_batch_size=512,
+            batch_size=4,
+            softmax_batch_size=4,
     ):
         self.sess = session
         self.batch_size = batch_size
@@ -275,8 +289,8 @@ class ManifoldEstimator:
     def __init__(
             self,
             session,
-            row_batch_size=10000,
-            col_batch_size=10000,
+            row_batch_size=5000,
+            col_batch_size=5000,
             nhood_sizes=(3,),
             clamp_to_percentile=None,
             eps=1e-5,
@@ -441,7 +455,8 @@ class DistanceBlock:
                 tf.cast(self._features_batch2, tf.float16),
             )
             self.distance_block = tf.cond(
-                tf.reduce_all(tf.math.is_finite(distance_block_16)),
+                # tf.reduce_all(tf.math.is_finite(distance_block_16)),
+                tf.reduce_all(tf.is_finite(distance_block_16)),
                 lambda: tf.cast(distance_block_16, tf.float32),
                 lambda: _batch_pairwise_distances(self._features_batch1, self._features_batch2),
             )
@@ -684,8 +699,10 @@ def _update_shapes(pool3):
         for o in op.outputs:
             shape = o.get_shape()
             if shape._dims is not None:  # pylint: disable=protected-access
-                # shape = [s.value for s in shape] TF 1.x
-                shape = [s for s in shape]  # TF 2.x
+                if tf.__version__[0] == '1':
+                    shape = [s.value for s in shape]  # TF 1.x
+                elif tf.__version__[0] == '2':
+                    shape = [s for s in shape]  # TF 2.x
                 new_shape = []
                 for j, s in enumerate(shape):
                     if s == 1 and j == 0:

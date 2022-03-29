@@ -4,14 +4,16 @@ Train a noised image classifier on ImageNet.
 
 import argparse
 import os
+import copy
 
 import blobfile as bf
 import torch as th
 import torch.distributed as dist
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.parallel.distributed import DistributedDataParallel as DDP
 from torch.optim import AdamW
-
+from tqdm import tqdm
 from guided_diffusion import dist_util, logger
 from guided_diffusion.fp16_util import MixedPrecisionTrainer
 from guided_diffusion.image_datasets import load_data
@@ -25,39 +27,40 @@ from guided_diffusion.script_util import (
     create_gaussian_diffusion,
 )
 from guided_diffusion.train_util import parse_resume_step_from_filename, log_loss_dict
-from tqdm import tqdm
-import torch.nn as nn
+
+import numpy as np
 
 
 def main():
     args = create_argparser().parse_args()
 
-    visible_gpus_list = [str(gpu_id) for gpu_id in args.gpus.split(",")]
-    dist_util.setup_dist(visible_gpu_list=visible_gpus_list)
-    logger.configure(dir=os.path.join(args.log_root, args.save_name))
+    visible_gpus_list = []
+    if args.gpus:
+        visible_gpus_list = [str(gpu_id) for gpu_id in args.gpus.split(",")]
 
+    dist_util.setup_dist(visible_gpu_list=visible_gpus_list, local_rank=args.local_rank)
+
+    logger.configure(dir=os.path.join(args.log_root, args.save_name))
+    logger.log(str(visible_gpus_list))
+    logger.log('current rank == {}, total_num = {}'.format(dist.get_rank(), dist.get_world_size()))
     logger.log(args)
+
+
     logger.log("creating classifier and diffusion...")
-    
+
     diffusion = create_gaussian_diffusion(
         **args_to_dict(args, diffusion_defaults().keys())
     )
+
     classifier = create_classifier(
-       **args_to_dict(args, classifier_defaults().keys()) 
+        **args_to_dict(args, classifier_defaults().keys())
     )
 
-    if args.classifier_path:
-        classifier.load_state_dict(
-            dist_util.load_state_dict(args.classifier_path, map_location="cpu"),
-            strict=True,
-        )
-
     classifier.to(dist_util.dev())
-    device = next(classifier.parameters()).device
 
     if args.noised:
         schedule_sampler = create_named_schedule_sampler(
-            args.schedule_sampler, diffusion
+            args.schedule_sampler, diffusion, args.t_range_start, args.t_range_end
         )
 
     resume_step = 0
@@ -74,10 +77,13 @@ def main():
             )
 
     # Needed for creating correct EMAs and fp16 parameters.
+    dist.barrier()
     dist_util.sync_params(classifier.parameters())
 
     mp_trainer = MixedPrecisionTrainer(
-        model=classifier, use_fp16=args.classifier_use_fp16, initial_lg_loss_scale=16.0
+        model=classifier,
+        use_fp16=args.classifier_use_fp16,
+        initial_lg_loss_scale=16.0
     )
 
     classifier = DDP(
@@ -98,17 +104,21 @@ def main():
         random_crop=True,
         dataset_type=args.dataset_type,
         used_attributes=args.used_attributes,
-        tot_class=args.tot_class
+        tot_class=args.tot_class,
+        imagenet200_class_list_file_path=args.imagenet200_class_list_file_path,
+        celeba_attribures_path=args.celeba_attribures_path
     )
     if args.val_data_dir:
         val_data = load_data(
             data_dir=args.val_data_dir,
-            batch_size=args.batch_size,
+            batch_size=args.batch_size * 2,
             image_size=args.classifier_image_size,
             class_cond=True,
             dataset_type=args.dataset_type,
             used_attributes=args.used_attributes,
-            tot_class=args.tot_class
+            tot_class=args.tot_class,
+            imagenet200_class_list_file_path=args.imagenet200_class_list_file_path,
+            celeba_attribures_path=args.celeba_attribures_path
         )
     else:
         val_data = None
@@ -128,47 +138,29 @@ def main():
 
     def forward_backward_log(data_loader, prefix="train"):
         batch, extra = next(data_loader)
-        labels = extra["y"].to(device)
+        labels = extra["y"].to(dist_util.dev())
 
-        batch = batch.to(device)
-
+        batch = batch.to(dist_util.dev())
         # Noisy images
         if args.noised:
-            t, _ = schedule_sampler.sample(batch.shape[0], device)
-            # print(t)
+            t, weight = schedule_sampler.sample(batch.shape[0], dist_util.dev())
             batch = diffusion.q_sample(batch, t)
         else:
-            t = th.zeros(batch.shape[0], dtype=th.long, device=device)
+            t = th.zeros(batch.shape[0], dtype=th.long, device=dist_util.dev())
 
         for i, (sub_batch, sub_labels, sub_t) in enumerate(
                 split_microbatches(args.microbatch, batch, labels, t)
         ):
-            # print(sub_batch.shape)
-            sig_op = nn.Sigmoid()
-            bceloss = nn.BCELoss(size_average=False, reduce=False)
+            assert not arg.use_MCD
 
             logits = classifier(sub_batch, timesteps=sub_t)
 
-            if args.dataset_type == 'celebahq':
-                logits = sig_op(logits)
-
-            if args.dataset_type == 'celebahq':
-                loss = bceloss(logits, sub_labels).mean(dim=-1)
-
-                a = th.ones_like(logits)
-                b = a * 0.
-                acc = th.where(logits > 0.5, a, b)
-                acc = (acc == sub_labels).type(th.FloatTensor).mean(dim=-1)
-
-            elif args.dataset_type == 'imagenet':
-                loss = F.cross_entropy(logits, sub_labels, reduction="none")
-            else:
-                raise
-
             losses = {}
-            losses[f"{prefix}_loss"] = loss.detach()
+            if args.dataset_type in ['imagenet-200', 'imagenet-1000']:
+                ce_loss = F.cross_entropy(logits, sub_labels, reduction="none")
+                losses[f"{prefix}_ce_loss"] = ce_loss.detach()
+                loss = 1.0 * ce_loss
 
-            if args.dataset_type == 'imagenet':
                 losses[f"{prefix}_acc@1"] = compute_top_k(
                     logits, sub_labels, k=1, reduction="none"
                 )
@@ -176,11 +168,13 @@ def main():
                     logits, sub_labels, k=5, reduction="none"
                 )
 
-            elif args.dataset_type == 'celebahq':
-                losses[f"{prefix}_acc@1"] = acc.detach()
-
-            else:
-                raise
+                if args.use_uncertainty_loss:
+                    log_probs = F.log_softmax(logits, dim=-1)
+                    probs = F.softmax(logits, dim=-1)  # (B, C)
+                    entropy = np.log(args.classifier_out_channels) + (log_probs * probs).sum(dim=-1)
+                    entropy_loss = entropy
+                    losses[f"{prefix}_entropy_loss"] = entropy_loss.detach()
+                    loss += args.uncertainty_lambda * entropy_loss
 
             log_loss_dict(diffusion, sub_t, losses)
             del losses
@@ -210,15 +204,12 @@ def main():
 
         if not step % args.log_interval:
             logger.dumpkvs()
-        if (
-                step
-                and dist.get_rank() == 0
-                and not (step + resume_step) % args.save_interval
-        ):
-            logger.log("saving model...")
-            save_model(mp_trainer, opt, step + resume_step)
 
-    if dist.get_rank() == 0:
+        if step and not (step + resume_step) % args.save_interval and dist.get_rank() == 0:
+                logger.log("saving model...")
+                save_model(mp_trainer, opt, step + resume_step)
+
+    if dist.get_rank() == 0:  # save at last
         logger.log("saving model...")
         save_model(mp_trainer, opt, step + resume_step)
     dist.barrier()
@@ -255,21 +246,6 @@ def split_microbatches(microbatch, *args):
         for i in range(0, bs, microbatch):
             yield tuple(x[i: i + microbatch] if x is not None else None for x in args)
 
-
-def save_files():
-    dir_names = ['datasets', 'guided_diffusion', 'scripts', 'bash']
-    file_names = ['classifier_sample.py', 'classifier_train.py', '*.bash']
-
-    save_path = os.path.join(logger.get_dir(), 'saved_files')
-    os.makedirs(save_path)
-
-    for n in dir_names:
-        os.system(f'cp -r {n} {save_path}')
-
-    for n in file_names:
-        os.system(f'cp {n} {save_path}')
-
-
 def create_argparser():
     defaults = dict(
         data_dir="",
@@ -282,27 +258,35 @@ def create_argparser():
         batch_size=4,
         microbatch=-1,
         schedule_sampler="uniform",
+        t_range_start=0,
+        t_range_end=1000,
         resume_checkpoint="",
 
-        log_interval=10000,
-        eval_interval=100,
+        log_interval=500,
+        eval_interval=500,
         save_interval=10000,
 
         log_root="",
         save_name="",
-        gpus='3',
+        gpus="",
 
+        # dataset
         tot_class=1000,
-        dataset_type='imagenet',
-        classifier_path="",
-
+        dataset_type='imagenet-1000',
         used_attributes="",
-        finetune_from_model_path = ""
+        imagenet200_class_list_file_path="",
+        celeba_attribures_path="",
+
+        # entropyConstraintTrain
+        use_uncertainty_loss=False,
+        uncertainty_lambda=0.,
     )
+
     defaults.update(classifier_defaults())
     defaults.update(diffusion_defaults())
-    
+
     parser = argparse.ArgumentParser()
+    parser.add_argument("--local_rank", type=int, default=0)
     add_dict_to_argparser(parser, defaults)
     return parser
 

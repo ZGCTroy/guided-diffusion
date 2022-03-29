@@ -6,7 +6,7 @@ import numpy as np
 import torch as th
 import torch.nn as nn
 import torch.nn.functional as F
-
+from .grad_reverse import GradReverse
 from .fp16_util import convert_module_to_f16, convert_module_to_f32
 from .nn import (
     checkpoint,
@@ -712,6 +712,8 @@ class EncoderUNetModel(nn.Module):
         resblock_updown=False,
         use_new_attention_order=False,
         pool="adaptive",
+
+        use_MCD=False
     ):
         super().__init__()
 
@@ -825,6 +827,9 @@ class EncoderUNetModel(nn.Module):
         )
         self._feature_size += ch
         self.pool = pool
+        self.use_MCD = use_MCD
+        if self.use_MCD:
+            self.gradient_reverse_layer = GradReverse(1.0)
         if pool == "adaptive":
             self.out = nn.Sequential(
                 normalization(ch),
@@ -833,6 +838,14 @@ class EncoderUNetModel(nn.Module):
                 zero_module(conv_nd(dims, ch, out_channels, 1)),
                 nn.Flatten(),
             )
+            if self.use_MCD:
+                self.out2 = nn.Sequential(
+                    normalization(ch),
+                    SiLU(),
+                    nn.AdaptiveAvgPool2d((1, 1)),
+                    zero_module(conv_nd(dims, ch, out_channels, 1)),
+                    nn.Flatten(),
+                )
         elif pool == "attention":
             assert num_head_channels != -1
             self.out = nn.Sequential(
@@ -842,12 +855,26 @@ class EncoderUNetModel(nn.Module):
                     (image_size // ds), ch, num_head_channels, out_channels
                 ),
             )
+            if self.use_MCD:
+                self.out2 = nn.Sequential(
+                    normalization(ch),
+                    SiLU(),
+                    AttentionPool2d(
+                        (image_size // ds), ch, num_head_channels, out_channels
+                    ),
+                )
         elif pool == "spatial":
             self.out = nn.Sequential(
                 nn.Linear(self._feature_size, 2048),
                 nn.ReLU(),
                 nn.Linear(2048, self.out_channels),
             )
+            if self.use_MCD:
+                self.out2 = nn.Sequential(
+                    nn.Linear(self._feature_size, 2048),
+                    nn.ReLU(),
+                    nn.Linear(2048, self.out_channels),
+                )
         elif pool == "spatial_v2":
             self.out = nn.Sequential(
                 nn.Linear(self._feature_size, 2048),
@@ -855,8 +882,16 @@ class EncoderUNetModel(nn.Module):
                 SiLU(),
                 nn.Linear(2048, self.out_channels),
             )
+            if self.use_MCD:
+                self.out2 = nn.Sequential(
+                    nn.Linear(self._feature_size, 2048),
+                    normalization(2048),
+                    SiLU(),
+                    nn.Linear(2048, self.out_channels),
+                )
         else:
             raise NotImplementedError(f"Unexpected {pool} pooling")
+
 
     def convert_to_fp16(self):
         """
@@ -872,14 +907,15 @@ class EncoderUNetModel(nn.Module):
         self.input_blocks.apply(convert_module_to_f32)
         self.middle_block.apply(convert_module_to_f32)
 
-    def forward(self, x, timesteps):
+    def extract_features(self, x, timesteps):
         """
-        Apply the model to an input batch.
+                Apply the model to an input batch.
 
-        :param x: an [N x C x ...] Tensor of inputs.
-        :param timesteps: a 1-D batch of timesteps.
-        :return: an [N x K] Tensor of outputs.
-        """
+                :param x: an [N x C x ...] Tensor of inputs.
+                :param timesteps: a 1-D batch of timesteps.
+                :return: an [N x K] Tensor of outputs.
+                """
+
         emb = self.time_embed(timestep_embedding(timesteps, self.model_channels))
 
         results = []
@@ -889,10 +925,40 @@ class EncoderUNetModel(nn.Module):
             if self.pool.startswith("spatial"):
                 results.append(h.type(x.dtype).mean(dim=(2, 3)))
         h = self.middle_block(h, emb)
+
         if self.pool.startswith("spatial"):
             results.append(h.type(x.dtype).mean(dim=(2, 3)))
-            h = th.cat(results, axis=-1)
-            return self.out(h)
+            features = th.cat(results, axis=-1)
         else:
-            h = h.type(x.dtype)
-            return self.out(h)
+            features = h.type(x.dtype)
+
+        return features
+
+    def classify(self, features):
+        if self.use_MCD:
+            return self.out(features), self.out2(features)
+        else:
+            return self.out(features)
+
+    def forward(self, x, timesteps=None, only_extract_features=False, only_classify=False, grad_reverse=False):
+        """
+        Apply the model to an input batch.
+
+        :param x: an [N x C x ...] Tensor of inputs.
+        :param timesteps: a 1-D batch of timesteps.
+        :return: an [N x K] Tensor of outputs.
+        """
+        if only_classify:
+            features = x
+        else:
+            features = self.extract_features(x, timesteps)
+
+        if grad_reverse:
+            features = self.gradient_reverse_layer.apply(features)
+
+        if only_extract_features:
+            return features
+        else:
+            outputs = self.classify(features)
+            return outputs
+

@@ -6,21 +6,24 @@ import blobfile as bf
 from mpi4py import MPI
 import numpy as np
 from torch.utils.data import DataLoader, Dataset
-
+import os
+import torch.distributed as dist
 
 def load_data(
-    *,
+        *,
 
-    data_dir,
-    batch_size,
-    image_size,
-    class_cond=False,
-    deterministic=False,
-    random_crop=False,
-    random_flip=True,
-    dataset_type="imagenet",
-    used_attributes="",
-    tot_class=1000
+        data_dir,
+        batch_size,
+        image_size,
+        class_cond=False,
+        deterministic=False,
+        random_crop=False,
+        random_flip=True,
+        dataset_type="imagenet-1000",
+        used_attributes="",
+        tot_class=1000,
+        imagenet200_class_list_file_path="",
+        celeba_attribures_path=""
 ):
     """
     For a dataset, create a generator over (images, kwargs) pairs.
@@ -49,41 +52,51 @@ def load_data(
     all_files = _list_image_files_recursively(data_dir)
     classes = None
 
-    CelebA_Attr_file = "list_attr_celeba.txt"
-    with open(CelebA_Attr_file, "r") as Attr_file:
-        Attr_info = Attr_file.readlines()
-        Attr_info = Attr_info[1:]
-
-    def get_attribute(path):
-        """
-        Given a image path, grab its corresponding attribute label 
-        """
-        import os
-        idx = int(os.path.basename(path)[:-4])
-        attributes = Attr_info[idx].split()
-        atts = []
-        for num in used_attributes.split(','):
-            idx = int(num)
-            att = (float(attributes[idx]) + 1.) / 2.
-            atts.append(att)
-        return atts
+    if dataset_type == 'celebahq':
+        with open(celeba_attribures_path, "r") as Attr_file:
+            Attr_info = Attr_file.readlines()
+            Attr_info = Attr_info[1:]
 
     if class_cond:
         # Assume classes are the first part of the filename,
         # before an underscore. 
-        if dataset_type == 'imagenet':
-            # path.split('/')[-2]
-            class_names = [path.split("/")[-2] for path in all_files]
+        # dir_path = '/mnt/data1/shengming/tiny-imagenet-200/train'
+        # dir_list = os.listdir(dir_path)
+
+        if dataset_type in ['imagenet-1000', 'imagenet-200']:
+            def get_class(path):
+                return os.path.dirname(path).split("/")[-1]
+
+            if dataset_type == 'imagenet-200':
+                with open(imagenet200_class_list_file_path, "r") as f:
+                    used_class_list = f.readlines()
+                    used_class_list = [p.strip() for p in used_class_list]
+                all_files = [path for path in all_files if get_class(path) in used_class_list]
+
+            class_names = [get_class(path) for path in all_files]
             sorted_classes = {x: i for i, x in enumerate(sorted(set(class_names)))}
 
-            class_names = [x for x in class_names if sorted_classes[x] < tot_class]
-            classes = [sorted_classes[x] for x in class_names]
-
-            all_files = [ x for x in all_files if sorted_classes[x.split("/")[-2]] < tot_class ]
-            assert len(all_files) == len(classes)
-            print(len(classes), len(class_names), len(all_files))
+            if tot_class > 0:
+                class_names = [x for x in class_names if sorted_classes[x] < tot_class]
+                classes = [sorted_classes[x] for x in class_names]
+                all_files = [path for path in all_files if sorted_classes[get_class(path)] < tot_class]
+                assert len(all_files) == len(classes)
 
         elif dataset_type == 'celebahq':
+            def get_attribute(path):
+                """
+                Given a image path, grab its corresponding attribute label
+                """
+                import os
+                idx = int(os.path.basename(path)[:-4])
+                attributes = Attr_info[idx].split()
+                atts = []
+                for num in used_attributes.split(','):
+                    idx = int(num)
+                    att = (float(attributes[idx]) + 1.) / 2.
+                    atts.append(att)
+                return atts
+
             classes = [get_attribute(path) for path in all_files]
 
     dataset = ImageDataset(
@@ -122,15 +135,15 @@ def _list_image_files_recursively(data_dir):
 
 class ImageDataset(Dataset):
     def __init__(
-        self,
-        resolution,
-        image_paths,
-        classes=None,
-        shard=0,
-        num_shards=1,
-        random_crop=False,
-        random_flip=True,
-        dataset_type='imagenet',
+            self,
+            resolution,
+            image_paths,
+            classes=None,
+            shard=0,
+            num_shards=1,
+            random_crop=False,
+            random_flip=True,
+            dataset_type='imagenet-1000',
 
     ):
         super().__init__()
@@ -140,7 +153,6 @@ class ImageDataset(Dataset):
         self.random_crop = random_crop
         self.random_flip = random_flip
         self.dataset_type = dataset_type
-
 
     def __len__(self):
         return len(self.local_images)
@@ -164,10 +176,8 @@ class ImageDataset(Dataset):
 
         out_dict = {}
         if self.local_classes is not None:
-            # out_dict["y"] = np.array(self.local_classes[idx], dtype=np.int64)
-            if self.dataset_type == 'imagenet':
+            if self.dataset_type in ['imagenet-1000', 'imagenet-200']:
                 out_dict["y"] = np.array(self.local_classes[idx], dtype=np.int64)
-
             elif self.dataset_type == 'celebahq':
                 out_dict["y"] = np.array(self.local_classes[idx], dtype=np.float32)
 
@@ -191,7 +201,7 @@ def center_crop_arr(pil_image, image_size):
     arr = np.array(pil_image)
     crop_y = (arr.shape[0] - image_size) // 2
     crop_x = (arr.shape[1] - image_size) // 2
-    return arr[crop_y : crop_y + image_size, crop_x : crop_x + image_size]
+    return arr[crop_y: crop_y + image_size, crop_x: crop_x + image_size]
 
 
 def random_crop_arr(pil_image, image_size, min_crop_frac=0.8, max_crop_frac=1.0):
@@ -215,4 +225,4 @@ def random_crop_arr(pil_image, image_size, min_crop_frac=0.8, max_crop_frac=1.0)
     arr = np.array(pil_image)
     crop_y = random.randrange(arr.shape[0] - image_size + 1)
     crop_x = random.randrange(arr.shape[1] - image_size + 1)
-    return arr[crop_y : crop_y + image_size, crop_x : crop_x + image_size]
+    return arr[crop_y: crop_y + image_size, crop_x: crop_x + image_size]

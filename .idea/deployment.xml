@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="PublishConfigData" autoUpload="Always" serverName="root@ssh.atom.ks.supremind.info:50079 agent" exclude=".svn;.cvs;.idea;.DS_Store;.git;.hg;*.hprof;*.pyc, *.jpg" remoteFilesAllowedToDisappearOnAutoupload="false">
+    <serverData>
+      <paths name="root@ssh.atom.ks.supremind.info:50079 agent">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/workspace/mnt/storage/guangcongzheng/zju_zgc/guided-diffusion" local="$PROJECT_DIR$" web="/" />
+          </mappings>
+          <excludedPaths>
+            <excludedPath path="/workspace/mnt/storage/guangcongzheng/zju_zgc/guided-diffusion/pretrain_model" />
+            <excludedPath path="/workspace/mnt/storage/guangcongzheng/zju_zgc/guided-diffusion/log" />
+            <excludedPath path="/workspace/mnt/storage/guangcongzheng/zju_zgc/guided-diffusion/homework" />
+            <excludedPath path="/workspace/mnt/storage/guangcongzheng/zju_zgc/guided-diffusion/imgs" />
+          </excludedPaths>
+        </serverdata>
+      </paths>
+      <paths name="shengming@10.214.130.29:22">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/home/shengming/zgc/guided-diffusion" local="$PROJECT_DIR$" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="shengming@10.214.130.31:22">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/home/shengming/zgc/guided-diffusion" local="$PROJECT_DIR$" />
+            <mapping deploy="/home/shengming/zgc_test/guided-diffusion" local="$PROJECT_DIR$" />
+          </mappings>
+        </serverdata>
+      </paths>
+    </serverData>
+    <option name="myAutoUpload" value="ALWAYS" />
+  </component>
+</project>

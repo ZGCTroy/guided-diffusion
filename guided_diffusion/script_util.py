@@ -31,7 +31,7 @@ def model_defaults():
         class_cond=False,
         use_checkpoint=False,
         attention_resolutions="16,8",
-        num_heads=4,
+        num_heads=-1,
         num_head_channels=-1,
         num_heads_upsample=-1,
         use_scale_shift_norm=True,
@@ -40,6 +40,28 @@ def model_defaults():
         use_fp16=False,
         use_new_attention_order=False,
         num_classes=1000
+    )
+    return res
+
+def ffhq256_ddpm_defaults(classes='16,21,25,31,40,'):
+    res = dict(
+        image_size=256,
+        num_channels=128,
+        num_res_blocks=1,
+        channel_mult="",
+        learn_sigma=False,
+        class_cond=False,
+        use_checkpoint=False,
+        attention_resolutions="16",
+        num_heads=4,
+        num_head_channels=-1,
+        num_heads_upsample=-1,
+        use_scale_shift_norm=True,
+        dropout=0.0,
+        resblock_updown=True,
+        use_fp16=False,
+        use_new_attention_order=False,
+        num_classes=None,
     )
     return res
 
@@ -54,8 +76,8 @@ def classifier_defaults():
         classifier_channel_mult="",
         classifier_use_checkpoint=False,
         classifier_attention_resolutions="32,16,8",
-        classifier_num_heads=4,
-        classifier_num_head_channels=64,
+        classifier_num_heads=-1,
+        classifier_num_head_channels=-1,
         classifier_num_heads_upsample=-1,
         classifier_use_scale_shift_norm=True,
         classifier_dropout=0.0,
@@ -63,7 +85,9 @@ def classifier_defaults():
         classifier_use_fp16=False,
         classifier_use_new_attention_order=False,
         classifier_pool="attention",
-        classifier_out_channels = 1000
+        classifier_out_channels = 1000,
+
+        use_MCD=False
     )
 
     return res
@@ -144,6 +168,8 @@ def create_classifier(
     classifier_pool,
     classifier_out_channels,
 
+    use_MCD
+
 ):
     if classifier_channel_mult == "":
         if classifier_image_size == 512:
@@ -180,7 +206,9 @@ def create_classifier(
         use_scale_shift_norm=classifier_use_scale_shift_norm,
         resblock_updown=classifier_resblock_updown,
         pool=classifier_pool,
-        use_new_attention_order=classifier_use_new_attention_order
+        use_new_attention_order=classifier_use_new_attention_order,
+
+        use_MCD=use_MCD
     )
 
 def create_gaussian_diffusion(
